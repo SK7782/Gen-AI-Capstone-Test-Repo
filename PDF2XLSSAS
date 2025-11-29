@@ -1,0 +1,183 @@
+import os
+from pathlib import Path
+
+import torch
+import pandas as pd
+from pdf2image import convert_from_path
+from PIL import Image
+
+from transformers import AutoImageProcessor, TableTransformerForObjectDetection
+from paddleocr import PaddleOCR
+
+# ---------- CONFIG ----------
+PDF_PATH = "payslip_sample.pdf"
+OUT_XLSX = "payslip_extracted.xlsx"
+POPPLER_PATH = None  # set if needed on Windows, e.g. r"C:\poppler\bin"
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Table transformer (detection)
+DETECTION_MODEL_ID = "microsoft/table-transformer-detection"
+
+# Confidence threshold for table detection
+TABLE_CONF_THRESHOLD = 0.6
+
+# ------------------ LOAD MODELS ------------------ #
+print("Loading Hugging Face Table Transformer...")
+image_processor = AutoImageProcessor.from_pretrained(DETECTION_MODEL_ID)
+table_detector = TableTransformerForObjectDetection.from_pretrained(DETECTION_MODEL_ID).to(DEVICE)
+
+print("Loading OCR (PaddleOCR)...")
+ocr = PaddleOCR(use_angle_cls=True, lang="en")  # adjust lang as needed
+
+# ------------------ UTILS ------------------ #
+def pdf_to_images(pdf_path):
+    pages = convert_from_path(pdf_path, dpi=200, poppler_path=POPPLER_PATH)
+    return pages
+
+def detect_tables_on_page(pil_image):
+    # Resize + normalize via image_processor
+    inputs = image_processor(images=pil_image, return_tensors="pt").to(DEVICE)
+    with torch.no_grad():
+        outputs = table_detector(**inputs)
+
+    # Post-process to get boxes in absolute pixel coords
+    width, height = pil_image.size
+    results = image_processor.post_process_object_detection(
+        outputs,
+        threshold=TABLE_CONF_THRESHOLD,
+        target_sizes=[(height, width)]
+    )[0]
+
+    table_boxes = []
+    for score, label, box in zip(results["scores"], results["labels"], results["boxes"]):
+        # label 0 usually is 'table' for this model
+        box = box.cpu().tolist()
+        xmin, ymin, xmax, ymax = box
+        table_boxes.append({
+            "score": float(score.cpu().item()),
+            "label": int(label.cpu().item()),
+            "bbox": (xmin, ymin, xmax, ymax),
+        })
+    return table_boxes
+
+def boxes_intersect(b1, b2):
+    # b = (xmin, ymin, xmax, ymax)
+    x1_min, y1_min, x1_max, y1_max = b1
+    x2_min, y2_min, x2_max, y2_max = b2
+
+    inter_xmin = max(x1_min, x2_min)
+    inter_ymin = max(y1_min, y2_min)
+    inter_xmax = min(x1_max, x2_max)
+    inter_ymax = min(y1_max, y2_max)
+
+    if inter_xmax <= inter_xmin or inter_ymax <= inter_ymin:
+        return False
+    return True
+
+def classify_block_y(y_center, img_height, header_ratio=0.2, footer_ratio=0.2):
+    # very rough heuristic
+    if y_center < img_height * header_ratio:
+        return "header"
+    elif y_center > img_height * (1 - footer_ratio):
+        return "footer"
+    else:
+        return "body"
+
+# ------------------ MAIN PIPELINE ------------------ #
+def process_pdf(pdf_path, out_xlsx):
+    pages = pdf_to_images(pdf_path)
+
+    non_tabular_records = []
+    table_sheets = {}
+
+    for page_idx, pil_img in enumerate(pages, start=1):
+        print(f"\nProcessing page {page_idx}...")
+        width, height = pil_img.size
+
+        # 1. Detect tables
+        table_boxes = detect_tables_on_page(pil_img)
+        print(f"  Found {len(table_boxes)} table(s).")
+
+        # 2. OCR entire page (returns boxes, lines, etc.)
+        # format: [[ [ [x1,y1,x2,y2,x3,y3,x4,y4], text, conf ], ... ]]
+        ocr_result = ocr.ocr(np.array(pil_img), cls=True)
+        if not ocr_result:
+            continue
+
+        # Flatten OCR output
+        words = []
+        for line in ocr_result[0]:
+            box, text_info = line
+            text = text_info[0]
+            conf = text_info[1]
+            # box is 4 points: [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
+            xs = [p[0] for p in box]
+            ys = [p[1] for p in box]
+            xmin, xmax = min(xs), max(xs)
+            ymin, ymax = min(ys), max(ys)
+            words.append({
+                "text": text,
+                "conf": conf,
+                "bbox": (xmin, ymin, xmax, ymax),
+            })
+
+        import numpy as np  # place import here to keep snippet compact
+
+        # 3. Split into table / non-table by bbox intersection
+        for w in words:
+            w_box = w["bbox"]
+            in_table_idx = None
+            for ti, t in enumerate(table_boxes):
+                if boxes_intersect(w_box, t["bbox"]):
+                    in_table_idx = ti
+                    break
+
+            x_min, y_min, x_max, y_max = w_box
+            x_center = (x_min + x_max) / 2
+            y_center = (y_min + y_max) / 2
+
+            if in_table_idx is None:
+                # non-table text
+                block_type = classify_block_y(y_center, height)
+                non_tabular_records.append({
+                    "page": page_idx,
+                    "block_type": block_type,
+                    "x_center": x_center,
+                    "y_center": y_center,
+                    "text": w["text"],
+                    "conf": w["conf"],
+                })
+            else:
+                # table text → assign to a table sheet key
+                tbl_name = f"Table_p{page_idx}_t{in_table_idx+1}"
+                if tbl_name not in table_sheets:
+                    table_sheets[tbl_name] = []
+                table_sheets[tbl_name].append({
+                    "page": page_idx,
+                    "table_id": in_table_idx + 1,
+                    "x_center": x_center,
+                    "y_center": y_center,
+                    "text": w["text"],
+                    "conf": w["conf"],
+                })
+
+    # 4. Build Excel file
+    with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
+        # non-tabular text sheet
+        if non_tabular_records:
+            df_non_tab = pd.DataFrame(non_tabular_records)
+            # sort to roughly preserve reading order
+            df_non_tab = df_non_tab.sort_values(by=["page", "block_type", "y_center", "x_center"])
+            df_non_tab.to_excel(writer, sheet_name="Non_tabular_text", index=False)
+
+        # naive per-table sheet (no real row/column reconstruction yet)
+        for sheet_name, entries in table_sheets.items():
+            df_tbl = pd.DataFrame(entries)
+            df_tbl = df_tbl.sort_values(by=["page", "y_center", "x_center"])
+            df_tbl.to_excel(writer, sheet_name=sheet_name[:31], index=False)
+
+    print(f"\nSaved extraction to: {out_xlsx}")
+
+if __name__ == "__main__":
+    process_pdf(PDF_PATH, OUT_XLSX)
